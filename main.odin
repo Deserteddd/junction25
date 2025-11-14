@@ -1,9 +1,10 @@
 package aigame
 
 import rl "vendor:raylib"
-import stb ""
+import stbi "vendor:stb/image"
+import "core:slice"
+import "core:strings"
 import "core:fmt"
-import "core:mem"
 
 vec2 :: [2]f32
 
@@ -23,19 +24,107 @@ SpriteSheet :: struct {
     rects: []rl.Rectangle
 }
 
-load_sprite_sheet :: proc(path: cstring) -> SpriteSheet {
-    sheet: SpriteSheet
-    using sheet
+Globals :: struct {
+    frame: u64
+}
 
-    img := rl.LoadImage(path)
-    assert(img.format == .UNCOMPRESSED_R8G8B8A8)
+g: Globals
 
-    bytes := mem.byte_slice(img.data, img.height*img.width*4)
-    for i: i32; i < img.height*img.width; i += 4 {
-        pixel: [4]byte = {bytes[i], bytes[i+1], bytes[i+2], bytes[i+3]}
-        if pixel.a != 0 do fmt.println(pixel)
+load_sprite_sheet :: proc(path: string) -> SpriteSheet {
+    pixels, size := load_pixels(path)
+    defer stbi.image_free(raw_data(pixels))
+    width  := size.x
+    height := size.y
+
+    horizontal_segments,
+    vertical_segments: [dynamic][2]i32
+    defer delete(horizontal_segments)
+    defer delete(vertical_segments)
+    {
+        non_empty_streak: i32
+        start: i32
+        for row: i32 = 0; row < height; row += 1 {
+            row_is_empty := true
+
+            row_start := row * width * 4
+
+            for col: i32 = 0; col < width; col += 1 {
+                alpha := pixels[row_start + col*4 + 3]
+
+                if alpha > 2 {
+                    row_is_empty = false
+                    break
+                }
+            }
+
+            if !row_is_empty {
+                if non_empty_streak == 0 do start = row
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > height/8 {
+                    segment: [2]i32 = {start, row}
+                    append(&horizontal_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    {
+        non_empty_streak: i32
+        start: i32
+
+        for col: i32 = 0; col < width; col += 1 {
+            col_is_empty := true
+
+            for row: i32 = 0; row < height; row += 1 {
+                pixel_index := row * width * 4 + col * 4
+                alpha := pixels[pixel_index + 3]
+
+                if alpha > 2 {
+                    col_is_empty = false
+                    break
+                }
+            }
+
+            if !col_is_empty {
+                if non_empty_streak == 0 do start = col
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > width/8 {
+                    segment: [2]i32 = {start, col}
+                    append(&vertical_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    rects: [dynamic]rl.Rectangle
+    for vertical, i in vertical_segments {
+        for horizontal, j in horizontal_segments {
+            rect := rl.Rectangle {
+                f32(vertical.x),
+                f32(horizontal.x), 
+                f32(vertical.y - vertical.x),
+                f32(horizontal.y - horizontal.x),
+            }
+            append(&rects, rect)
+        }
+    }
+    for rect in rects {
+        fmt.println(rect)
+
+    }
+    rl_img: rl.Image = {
+        data = raw_data(pixels),
+        width = size.x,
+        height = size.y,
+        mipmaps = 1,
+        format = .UNCOMPRESSED_R8G8B8A8
     }
 
+    sheet: SpriteSheet
+    sheet.texture = rl.LoadTextureFromImage(rl_img)
+    sheet.rects = rects[:]
     return sheet
 }
 
@@ -72,7 +161,7 @@ main :: proc() {
     rl.SetTargetFPS(60)
     rl.SetTraceLogLevel(.WARNING)
     for !rl.WindowShouldClose() {
-        
+        defer g.frame += 1
         if !update(&state) do break
         draw(state)
     }
@@ -98,7 +187,15 @@ draw :: proc(state: GameState) {
     win_y := rl.GetScreenHeight()
 
     // Draw player
-    rl.DrawTextureEx(state.player.sprite, state.player.position, 0, 0.25, 255)
+    // rl.DrawTextureEx(state.player.sprite, state.player.position, 0, 0.25, 255)
+
+    sprite_count := u64(len(state.sprite_sheet.rects))
+    rl.DrawTextureRec(
+        state.sprite_sheet.texture, 
+        state.sprite_sheet.rects[g.frame/4%sprite_count],
+        state.player.position,
+        255
+    )
     
     rl.EndDrawing()
 }
