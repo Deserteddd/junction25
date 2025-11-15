@@ -7,13 +7,13 @@ from urllib.error import HTTPError, URLError
 
 load_dotenv()
 
-API_KEY = os.getenv("API_KEY")
+python_API_KEY = os.getenv("python_API_KEY")
 
 url = "https://api.retrodiffusion.ai/v1/inferences"
 
 
 headers = {
-    "X-RD-Token": API_KEY,
+    "X-RD-Token": python_API_KEY,
     "Content-Type": "application/json",
 }
 
