@@ -1,41 +1,158 @@
 package aigame
 
 import rl "vendor:raylib"
-import stb ""
+import stbi "vendor:stb/image"
+import "core:slice"
+import "core:strings"
 import "core:fmt"
-import "core:mem"
+import "core:math"
+import "core:math/linalg"
+
+dist :: linalg.distance
+sin :: math.sin
+cos :: math.cos
 
 vec2 :: [2]f32
 
+Rect :: rl.Rectangle
+
 GameState :: struct {
-    player: Player,
-    sprite_sheet: SpriteSheet
+    player:         Player,
+    sprite_sheets:  [dynamic]SpriteSheet,
+    projectiles:    [dynamic]Projectile,
+    enemies:        [dynamic]Enemy,
+    active_sheet:   i32,
+}
+
+Enemy :: struct {
+    position: vec2,
+    radius:   f32,
+    speed:    f32,
+}
+
+Projectile :: struct {
+    position:   vec2,
+    radius:     f32,
+    speed:      f32,
+    direction:  f32,
+    damage:     f32,
+    sheet:      ^SpriteSheet
 }
 
 Player :: struct {
-    position: vec2,
-    speed: f32,
-    sprite: rl.Texture2D
+    sprite:         rl.Texture2D,
+    attack_speed:   f32
 }
 
 SpriteSheet :: struct {
     texture: rl.Texture2D,
-    rects: []rl.Rectangle
+    rects:   []Rect
 }
 
-load_sprite_sheet :: proc(path: cstring) -> SpriteSheet {
-    sheet: SpriteSheet
-    using sheet
+Globals :: struct {
+    frame:          u64,
+    t_since_attack: f32,
+    win_size:       vec2,
+    current_wave:   i32
+}
 
-    img := rl.LoadImage(path)
-    assert(img.format == .UNCOMPRESSED_R8G8B8A8)
+g: Globals
 
-    bytes := mem.byte_slice(img.data, img.height*img.width*4)
-    for i: i32; i < img.height*img.width; i += 4 {
-        pixel: [4]byte = {bytes[i], bytes[i+1], bytes[i+2], bytes[i+3]}
-        if pixel.a != 0 do fmt.println(pixel)
+load_sprite_sheet :: proc(path: string) -> SpriteSheet {
+    pixels, size := load_pixels(path)
+    defer stbi.image_free(raw_data(pixels))
+    width  := size.x
+    height := size.y
+
+    horizontal_segments,
+    vertical_segments: [dynamic][2]i32
+    defer delete(horizontal_segments)
+    defer delete(vertical_segments)
+    {
+        non_empty_streak: i32
+        start: i32
+        for row: i32 = 0; row < height; row += 1 {
+            row_is_empty := true
+
+            row_start := row * width * 4
+
+            for col: i32 = 0; col < width; col += 1 {
+                alpha := pixels[row_start + col*4 + 3]
+
+                if alpha > 2 {
+                    row_is_empty = false
+                    break
+                }
+            }
+
+            if !row_is_empty {
+                if non_empty_streak == 0 do start = row
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > height/8 {
+                    segment: [2]i32 = {start, row}
+                    append(&horizontal_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    {
+        non_empty_streak: i32
+        start: i32
+
+        for col: i32 = 0; col < width; col += 1 {
+            col_is_empty := true
+
+            for row: i32 = 0; row < height; row += 1 {
+                pixel_index := row * width * 4 + col * 4
+                alpha := pixels[pixel_index + 3]
+
+                if alpha > 2 {
+                    col_is_empty = false
+                    break
+                }
+            }
+
+            if !col_is_empty {
+                if non_empty_streak == 0 do start = col
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > width/8 {
+                    segment: [2]i32 = {start, col}
+                    append(&vertical_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    rects: [dynamic]Rect
+    for vertical, i in vertical_segments {
+        for horizontal, j in horizontal_segments {
+            rect := Rect {
+                f32(vertical.x),
+                f32(horizontal.x), 
+                f32(vertical.y - vertical.x),
+                f32(horizontal.y - horizontal.x),
+            }
+            append(&rects, rect)
+        }
+    }
+    for rect in rects {
+        fmt.println(rect)
+
+    }
+    rl_img: rl.Image = {
+        data = raw_data(pixels),
+        width = size.x,
+        height = size.y,
+        mipmaps = 1,
+        format = .UNCOMPRESSED_R8G8B8A8
     }
 
+    sheet: SpriteSheet
+    sheet.texture = rl.LoadTextureFromImage(rl_img)
+    sheet.rects = rects[:]
     return sheet
 }
 
@@ -48,6 +165,13 @@ load_pixels :: proc(path: string) -> (pixels: []byte, size: [2]i32) {
     return
 }
 
+toggle_fullscreen :: proc() {
+    rl.ToggleBorderlessWindowed()
+    screen_h := f32(rl.GetScreenHeight())
+    screen_w := f32(rl.GetScreenWidth())
+    g.win_size = {screen_w, screen_h}
+}
+
 init :: proc() -> GameState {
     state: GameState
     using state
@@ -55,16 +179,16 @@ init :: proc() -> GameState {
     {
         using player
         anton := rl.LoadTexture("assets/pixelanton.jpg")
-        player.speed = 5
+        player.attack_speed = 5
         player.sprite = anton
     }
-    
-    sprite_sheet = load_sprite_sheet("assets/gpt_test1.png")
+    append(&state.sprite_sheets, load_sprite_sheet("assets/gpt_test1.png"))
     return state
 }
 
 main :: proc() {
     rl.InitWindow(1280, 720, "Odin + raylib window")
+    g.win_size = {1280, 720}
     defer rl.CloseWindow()
 
     state := init()
@@ -72,33 +196,175 @@ main :: proc() {
     rl.SetTargetFPS(60)
     rl.SetTraceLogLevel(.WARNING)
     for !rl.WindowShouldClose() {
-        
+        defer g.frame += 1
         if !update(&state) do break
+
+        rl.BeginDrawing()
+        rl.ClearBackground(20)
         draw(state)
+        rl.EndDrawing()
     }
 }
 
 update :: proc(state: ^GameState) -> bool {
     if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyDown(.C) do return false
-    if rl.IsKeyDown(.F) do rl.ToggleBorderlessWindowed()
-    {
-        using state.player
-        if rl.IsKeyDown(.W) do position.y -= speed
-        if rl.IsKeyDown(.A) do position.x -= speed
-        if rl.IsKeyDown(.S) do position.y += speed
-        if rl.IsKeyDown(.D) do position.x += speed
+    if rl.IsKeyPressed(.F) do toggle_fullscreen()
+    if rl.IsKeyDown(.SPACE) do spawn_enemy(state)
+    dt := rl.GetFrameTime()
+    g.t_since_attack += dt
+    if g.t_since_attack >= 1/state.player.attack_speed {
+        g.t_since_attack = 0
+        shoot(state)
+    }
+    for &p, i in state.projectiles {
+        if dist(p.position, 600) > 2000 do unordered_remove(&state.projectiles, i)
+        dx := cos(p.direction);
+        dy := sin(p.direction);
+
+        p.position.x += dx * p.speed * dt;
+        p.position.y -= dy * p.speed * dt;
+    }
+    center := g.win_size/2
+    for &e in state.enemies {
+        dir := center - e.position
+        len := math.sqrt(dir.x*dir.x + dir.y*dir.y);
+        if len > 0 {
+            dir /= len;
+        }
+        e.position += dir * e.speed * dt;
+    }
+    for e, i in state.enemies {
+        for p, j in state.projectiles {
+            if circle_intersect(e.position, e.radius, p.position, p.radius) {
+                unordered_remove(&state.enemies, i)
+                unordered_remove(&state.projectiles, j)
+                break
+            }
+        }
     }
     return true
 }
 
-draw :: proc(state: GameState) {
-    rl.BeginDrawing()
-    rl.ClearBackground(20)
-    win_x := rl.GetScreenWidth()
-    win_y := rl.GetScreenHeight()
+circle_intersect :: proc(p1: vec2, r1: f32, p2: vec2, r2: f32) -> bool {
+    return dist(p1, p2) < r1+r2
+}
 
-    // Draw player
-    rl.DrawTextureEx(state.player.sprite, state.player.position, 0, 0.25, 255)
-    
-    rl.EndDrawing()
+spawn_enemy :: proc(state: ^GameState) {
+    margin   := f32(64); // Distance outside screen bounds
+    side := rl.GetRandomValue(0, 3); // 0=left, 1=right, 2=top, 3=bottom
+    enemy_pos := vec2{};
+
+    switch side {
+    case 0: // Left
+        enemy_pos = {
+            -margin,
+            f32(rl.GetRandomValue(0, i32(g.win_size.y))),
+        };
+    case 1: // Right
+        enemy_pos = {
+            g.win_size.x + margin,
+            f32(rl.GetRandomValue(0, i32(g.win_size.y))),
+        };
+    case 2: // Top
+        enemy_pos = {
+            f32(rl.GetRandomValue(0, i32(g.win_size.x))),
+            -margin,
+        };
+    case 3: // Bottom
+        enemy_pos = {
+            f32(rl.GetRandomValue(0, i32(g.win_size.x))),
+            g.win_size.y + margin,
+        };
+    }
+
+    enemy := Enemy{
+        speed    = 50, // customize as needed
+        position = enemy_pos,
+        radius   = 32
+    };
+
+    append(&state.enemies, enemy);
+}
+
+dir_to_closest_enemy :: proc(state: ^GameState) -> f32 {
+    centre := g.win_size/2
+    min_dist: f32 = 1e12
+    min_pos: vec2
+    for e in state.enemies {
+        distance := dist(e.position, centre)
+        if distance < min_dist {
+            min_dist = distance
+            min_pos = e.position
+        }
+    }
+    dir := min_pos - centre
+    dir_vec := vec2{
+        min_pos.x - centre.x,
+        centre.y - min_pos.y
+    };
+    direction := math.atan2(dir_vec.y, dir_vec.x);
+
+    return direction
+}
+
+shoot :: proc(state: ^GameState) {
+    origin := g.win_size/2;
+
+    direction := dir_to_closest_enemy(state)
+    sheet := &state.sprite_sheets[state.active_sheet]
+    max_size: f32
+    for frame in sheet.rects {
+        size := math.min(frame.height, frame.width)
+        if size > max_size do max_size = size
+    }
+    projectile: Projectile = {
+        position    = origin,
+        radius      = max_size/8,
+        speed       = 500,
+        direction   = direction,
+        damage      = 1,
+        sheet       = sheet
+    }
+    append(&state.projectiles, projectile)
+}
+
+draw :: proc(state: GameState) {
+
+
+    for p in state.projectiles {
+        frame := g.frame/2%u64(len(p.sheet.rects))
+        dst_rect := Rect {
+            p.position.x, 
+            p.position.y, 
+            p.sheet.rects[frame].width/4, 
+            p.sheet.rects[frame].height/4
+        }
+        rl.DrawTexturePro(
+            p.sheet.texture,
+            p.sheet.rects[frame],
+            dst_rect,
+            {dst_rect.width/2, dst_rect.height/2},
+            -math.to_degrees(p.direction)+180,
+            255
+        )
+    }
+    for e in state.enemies {
+        rl.DrawCircleV(e.position, e.radius, rl.RED)
+    }
+
+    // Player
+    {
+        player_sprite := state.player.sprite
+        scale: f32 = 0.1
+        centre := g.win_size/2
+        rl.DrawTextureEx(
+            player_sprite, 
+            {centre.x-f32(player_sprite.width)*scale/2, centre.y-f32(player_sprite.height)*scale/2},
+            0,
+            scale,
+            255
+        )
+    }
+
+    rl.DrawFPS(10, 10)
 }
