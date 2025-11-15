@@ -4,10 +4,9 @@ import rl "vendor:raylib"
 import stbi "vendor:stb/image"
 import "core:slice"
 import "core:strings"
-import "core:fmt"
 import "core:math"
 import "core:math/linalg"
-import "core:sort"
+import "core:time"
 
 dist :: linalg.distance
 sin :: math.sin
@@ -30,7 +29,7 @@ Enemy :: struct {
     radius:    f32,
     speed:     f32,
     direction: Direction,
-    sheet:     ^SpriteSheet
+    sheet:     ^SpriteSheet,
 }
 
 Direction :: enum u8 {
@@ -64,116 +63,16 @@ Globals :: struct {
     frame:          u64,
     t_since_attack: f32,
     win_size:       vec2,
-    current_wave:   i32
+    current_wave:   int,
+    wave_remaining: int,
+    wave_total:     int,
+    wave_destroyed: int,
+    t_since_spawn:  time.Time
 }
 
 g: Globals
 
-load_sprite_sheet :: proc(path: string) -> SpriteSheet {
-    pixels, size := load_pixels(path)
-    defer stbi.image_free(raw_data(pixels))
-    width  := size.x
-    height := size.y
 
-    horizontal_segments,
-    vertical_segments: [dynamic][2]i32
-    defer delete(horizontal_segments)
-    defer delete(vertical_segments)
-    {
-        non_empty_streak: i32
-        start: i32
-        for row: i32 = 0; row < height; row += 1 {
-            row_is_empty := true
-
-            row_start := row * width * 4
-
-            for col: i32 = 0; col < width; col += 1 {
-                alpha := pixels[row_start + col*4 + 3]
-
-                if alpha > 2 {
-                    row_is_empty = false
-                    break
-                }
-            }
-
-            if !row_is_empty {
-                if non_empty_streak == 0 do start = row
-                non_empty_streak += 1
-            } else {
-                if non_empty_streak > 10 {
-                    segment: [2]i32 = {start, row}
-                    append(&horizontal_segments, segment)
-                }
-                non_empty_streak = 0
-            }
-        }
-    }
-    {
-        non_empty_streak: i32
-        start: i32
-
-        for col: i32 = 0; col < width; col += 1 {
-            col_is_empty := true
-
-            for row: i32 = 0; row < height; row += 1 {
-                pixel_index := row * width * 4 + col * 4
-                alpha := pixels[pixel_index + 3]
-
-                if alpha > 2 {
-                    col_is_empty = false
-                    break
-                }
-            }
-
-            if !col_is_empty {
-                if non_empty_streak == 0 do start = col
-                non_empty_streak += 1
-            } else {
-                if non_empty_streak > 10 {
-                    segment: [2]i32 = {start, col}
-                    fmt.println("Yess")
-                    append(&vertical_segments, segment)
-                }
-                non_empty_streak = 0
-            }
-        }
-    }
-    fmt.println(horizontal_segments)
-    fmt.println(vertical_segments)
-    rects: [dynamic]Rect
-    for vertical, i in vertical_segments {
-        for horizontal, j in horizontal_segments {
-            rect := Rect {
-                f32(vertical.x),
-                f32(horizontal.x), 
-                f32(vertical.y - vertical.x),
-                f32(horizontal.y - horizontal.x),
-            }
-            append(&rects, rect)
-        }
-    }
-    rl_img: rl.Image = {
-        data = raw_data(pixels),
-        width = size.x,
-        height = size.y,
-        mipmaps = 1,
-        format = .UNCOMPRESSED_R8G8B8A8
-    }
-    sheet: SpriteSheet
-    sheet.texture = rl.LoadTextureFromImage(rl_img)
-    sheet.rects = rects[:]
-    return sheet
-}
-
-load_pixels :: proc(path: string) -> (pixels: []byte, size: [2]i32) {
-    path_cstr := strings.clone_to_cstring(path, context.temp_allocator);
-    pixel_data := stbi.load(path_cstr, &size.x, &size.y, nil, 4)
-    assert(size != 0)
-    assert(pixel_data != nil)
-    pixels = slice.bytes_from_ptr(pixel_data, int(size.x * size.y * 4))
-    assert(pixels != nil)
-    return
-}
 
 toggle_fullscreen :: proc() {
     rl.ToggleBorderlessWindowed()
@@ -189,18 +88,23 @@ init :: proc() -> GameState {
     {
         using player
         anton := rl.LoadTexture("assets/pixelanton.jpg")
-        attack_speed = 10
+        attack_speed = 8
         sprite = anton
         attack_radius = 350
     }
     append(&state.sprite_sheets, load_sprite_sheet("assets/gpt_test1.png"))
     append(&state.sprite_sheets, load_sprite_sheet("assets/zimbo.png"))
+
+    g.current_wave = 1
+    g.wave_remaining = 15
+    g.wave_total     = 15
     return state
 }
 
 main :: proc() {
     rl.InitWindow(1280, 720, "Odin + raylib window")
     g.win_size = {1280, 720}
+    toggle_fullscreen()
     defer rl.CloseWindow()
 
     state := init()
@@ -209,6 +113,21 @@ main :: proc() {
     rl.SetTraceLogLevel(.WARNING)
     for !rl.WindowShouldClose() {
         defer g.frame += 1
+        free_all(context.temp_allocator)
+        if g.wave_remaining == 0 && len(state.enemies) == 0 {
+            g.current_wave += 1
+            g.wave_destroyed = 0
+            g.wave_total = int(10*f32(g.current_wave)*1.25)
+            g.wave_remaining = g.wave_total
+        } else if g.wave_remaining > 0 {
+            spawn_interval := 10 / f64(g.wave_total)
+            if time.duration_seconds(time.since(g.t_since_spawn)) >= spawn_interval {
+                spawn_enemy(&state)
+                g.wave_remaining -= 1
+                g.t_since_spawn = time.now()
+            } 
+
+        }
         if !update(&state) do break
 
         rl.BeginDrawing()
@@ -223,12 +142,6 @@ update :: proc(state: ^GameState) -> bool {
     if rl.IsKeyPressed(.F) do toggle_fullscreen()
     dt := rl.GetFrameTime()
 
-    // if rl.IsKeyDown(.W) do g.player_pos.y -= dt * 100
-    // if rl.IsKeyDown(.S) do g.player_pos.y += dt * 100
-    // if rl.IsKeyDown(.A) do g.player_pos.x -= dt * 100
-    // if rl.IsKeyDown(.D) do g.player_pos.x += dt * 100
-
-    if rl.GetRandomValue(1, 10) == 10 do spawn_enemy(state)
     g.t_since_attack += dt
     if g.t_since_attack >= 1/state.player.attack_speed {
         g.t_since_attack = 0
@@ -246,7 +159,10 @@ update :: proc(state: ^GameState) -> bool {
         p.position.y -= dy * p.speed * dt;
     }
     center := g.win_size/2
-    for &e in state.enemies {
+    for &e, i in state.enemies {
+        if dist(e.position, center) < 1 {
+            return false
+        }
         dir := center - e.position
         len := math.sqrt(dir.x*dir.x + dir.y*dir.y);
         if len > 0 {
@@ -254,11 +170,12 @@ update :: proc(state: ^GameState) -> bool {
         }
         e.position += dir * e.speed * dt;
     }
-    for e, i in state.enemies {
+    for &e, i in state.enemies {
         for p, j in state.projectiles {
             if circle_intersect(e.position, e.radius, p.position, p.radius) {
                 unordered_remove(&state.enemies, i)
                 unordered_remove(&state.projectiles, j)
+                g.wave_destroyed += 1
                 break
             }
         }
@@ -351,7 +268,7 @@ shoot :: proc(state: ^GameState) {
         radius      = max_size/8,
         speed       = 500,
         direction   = dir,
-        damage      = 1,
+        damage      = 0.25,
         sheet       = sheet
     }
     append(&state.projectiles, projectile)
@@ -386,6 +303,7 @@ draw :: proc(state: GameState) {
             e.sheet.rects[frame].width/2, 
             e.sheet.rects[frame].height/2
         }
+
         rl.DrawTexturePro(
             e.sheet.texture,
             e.sheet.rects[frame],
@@ -408,6 +326,118 @@ draw :: proc(state: GameState) {
             255
         )
     }
+    builder: strings.Builder
+    strings.builder_init(&builder, context.temp_allocator)
+    strings.write_string(&builder, "Wave: ")
+    strings.write_int(&builder, g.current_wave)
+    rl.DrawText(strings.to_cstring(&builder), 10, 30, 24, rl.WHITE)
 
+    strings.builder_reset(&builder)
+    strings.write_string(&builder, "Remaining: ")
+    strings.write_int(&builder, g.wave_total - g.wave_destroyed)
+    rl.DrawText(strings.to_cstring(&builder), 10, 60, 24, rl.WHITE)
     rl.DrawFPS(10, 10)
+}
+
+load_sprite_sheet :: proc(path: string) -> SpriteSheet {
+    pixels, size := load_pixels(path)
+    defer stbi.image_free(raw_data(pixels))
+    width  := size.x
+    height := size.y
+
+    horizontal_segments,
+    vertical_segments: [dynamic][2]i32
+    defer delete(horizontal_segments)
+    defer delete(vertical_segments)
+    {
+        non_empty_streak: i32
+        start: i32
+        for row: i32 = 0; row < height; row += 1 {
+            row_is_empty := true
+
+            row_start := row * width * 4
+
+            for col: i32 = 0; col < width; col += 1 {
+                alpha := pixels[row_start + col*4 + 3]
+
+                if alpha > 2 {
+                    row_is_empty = false
+                    break
+                }
+            }
+
+            if !row_is_empty {
+                if non_empty_streak == 0 do start = row
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > 10 {
+                    segment: [2]i32 = {start, row}
+                    append(&horizontal_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    {
+        non_empty_streak: i32
+        start: i32
+
+        for col: i32 = 0; col < width; col += 1 {
+            col_is_empty := true
+
+            for row: i32 = 0; row < height; row += 1 {
+                pixel_index := row * width * 4 + col * 4
+                alpha := pixels[pixel_index + 3]
+
+                if alpha > 2 {
+                    col_is_empty = false
+                    break
+                }
+            }
+
+            if !col_is_empty {
+                if non_empty_streak == 0 do start = col
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > 10 {
+                    segment: [2]i32 = {start, col}
+                    append(&vertical_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    rects: [dynamic]Rect
+    for vertical, i in vertical_segments {
+        for horizontal, j in horizontal_segments {
+            rect := Rect {
+                f32(vertical.x),
+                f32(horizontal.x), 
+                f32(vertical.y - vertical.x),
+                f32(horizontal.y - horizontal.x),
+            }
+            append(&rects, rect)
+        }
+    }
+    rl_img: rl.Image = {
+        data = raw_data(pixels),
+        width = size.x,
+        height = size.y,
+        mipmaps = 1,
+        format = .UNCOMPRESSED_R8G8B8A8
+    }
+    sheet: SpriteSheet
+    sheet.texture = rl.LoadTextureFromImage(rl_img)
+    sheet.rects = rects[:]
+    return sheet
+}
+
+load_pixels :: proc(path: string) -> (pixels: []byte, size: [2]i32) {
+    path_cstr := strings.clone_to_cstring(path, context.temp_allocator);
+    pixel_data := stbi.load(path_cstr, &size.x, &size.y, nil, 4)
+    assert(size != 0)
+    assert(pixel_data != nil)
+    pixels = slice.bytes_from_ptr(pixel_data, int(size.x * size.y * 4))
+    assert(pixels != nil)
+    return
 }
