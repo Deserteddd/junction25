@@ -21,7 +21,7 @@ GameState :: struct {
     sprite_sheets:  [dynamic]SpriteSheet,
     projectiles:    [dynamic]Projectile,
     enemies:        [dynamic]Enemy,
-    active_sheet:   i32
+    active_sheet:   i32,
 }
 
 Enemy :: struct {
@@ -52,7 +52,8 @@ SpriteSheet :: struct {
 Globals :: struct {
     frame:          u64,
     t_since_attack: f32,
-    win_size:    vec2
+    win_size:       vec2,
+    current_wave:   i32
 }
 
 g: Globals
@@ -197,7 +198,11 @@ main :: proc() {
     for !rl.WindowShouldClose() {
         defer g.frame += 1
         if !update(&state) do break
+
+        rl.BeginDrawing()
+        rl.ClearBackground(20)
         draw(state)
+        rl.EndDrawing()
     }
 }
 
@@ -221,17 +226,11 @@ update :: proc(state: ^GameState) -> bool {
     }
     center := g.win_size/2
     for &e in state.enemies {
-
-        // Direction vector from enemy to center
         dir := center - e.position
-
-        // Normalize
         len := math.sqrt(dir.x*dir.x + dir.y*dir.y);
         if len > 0 {
             dir /= len;
         }
-
-        // Move enemy (Raylib Y-down coords, so no flipping needed)
         e.position += dir * e.speed * dt;
     }
     for e, i in state.enemies {
@@ -261,19 +260,16 @@ spawn_enemy :: proc(state: ^GameState) {
             -margin,
             f32(rl.GetRandomValue(0, i32(g.win_size.y))),
         };
-
     case 1: // Right
         enemy_pos = {
             g.win_size.x + margin,
             f32(rl.GetRandomValue(0, i32(g.win_size.y))),
         };
-
     case 2: // Top
         enemy_pos = {
             f32(rl.GetRandomValue(0, i32(g.win_size.x))),
             -margin,
         };
-
     case 3: // Bottom
         enemy_pos = {
             f32(rl.GetRandomValue(0, i32(g.win_size.x))),
@@ -281,7 +277,6 @@ spawn_enemy :: proc(state: ^GameState) {
         };
     }
 
-    // Create enemy
     enemy := Enemy{
         speed    = 50, // customize as needed
         position = enemy_pos,
@@ -303,24 +298,19 @@ dir_to_closest_enemy :: proc(state: ^GameState) -> f32 {
         }
     }
     dir := min_pos - centre
+    dir_vec := vec2{
+        min_pos.x - centre.x,
+        centre.y - min_pos.y
+    };
+    direction := math.atan2(dir_vec.y, dir_vec.x);
 
-    angle_rad := math.atan2(dir.x, -dir.y)
-
-    return math.to_degrees(angle_rad)
+    return direction
 }
 
 shoot :: proc(state: ^GameState) {
     origin := g.win_size/2;
-    mouse := vec2{
-        f32(rl.GetMouseX()),
-        f32(rl.GetMouseY()),
-    };
-    dir_vec := vec2{
-        mouse.x - origin.x,
-        origin.y - mouse.y
-    };
-    direction := math.atan2(dir_vec.y, dir_vec.x);
-    // direction := dir_to_closest_enemy(state)
+
+    direction := dir_to_closest_enemy(state)
     sheet := &state.sprite_sheets[state.active_sheet]
     max_size: f32
     for frame in sheet.rects {
@@ -339,8 +329,7 @@ shoot :: proc(state: ^GameState) {
 }
 
 draw :: proc(state: GameState) {
-    rl.BeginDrawing()
-    rl.ClearBackground(20)
+
 
     for p in state.projectiles {
         frame := g.frame/2%u64(len(p.sheet.rects))
@@ -358,10 +347,8 @@ draw :: proc(state: GameState) {
             -math.to_degrees(p.direction)+180,
             255
         )
-        rl.DrawCircleLinesV(p.position, p.radius, rl.YELLOW)
     }
     for e in state.enemies {
-        // rl.DrawRectangleRec(e.rect, rl.RED)
         rl.DrawCircleV(e.position, e.radius, rl.RED)
     }
 
@@ -378,6 +365,6 @@ draw :: proc(state: GameState) {
             255
         )
     }
+
     rl.DrawFPS(10, 10)
-    rl.EndDrawing()
 }
