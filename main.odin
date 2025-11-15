@@ -12,6 +12,7 @@ import "core:sort"
 dist :: linalg.distance
 sin :: math.sin
 cos :: math.cos
+abs :: math.abs
 
 vec2 :: [2]f32
 
@@ -42,7 +43,8 @@ Projectile :: struct {
 
 Player :: struct {
     sprite:         rl.Texture2D,
-    attack_speed:   f32
+    attack_speed:   f32,
+    attack_radius:  f32
 }
 
 SpriteSheet :: struct {
@@ -139,10 +141,6 @@ load_sprite_sheet :: proc(path: string) -> SpriteSheet {
             append(&rects, rect)
         }
     }
-    for rect in rects {
-        fmt.println(rect)
-
-    }
     rl_img: rl.Image = {
         data = raw_data(pixels),
         width = size.x,
@@ -180,8 +178,9 @@ init :: proc() -> GameState {
     {
         using player
         anton := rl.LoadTexture("assets/pixelanton.jpg")
-        player.attack_speed = 5
-        player.sprite = anton
+        attack_speed = 10
+        sprite = anton
+        attack_radius = 350
     }
     append(&state.sprite_sheets, load_sprite_sheet("assets/gpt_test1.png"))
     return state
@@ -210,7 +209,7 @@ main :: proc() {
 update :: proc(state: ^GameState) -> bool {
     if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyDown(.C) do return false
     if rl.IsKeyPressed(.F) do toggle_fullscreen()
-    if rl.IsKeyDown(.SPACE) do spawn_enemy(state)
+    if rl.GetRandomValue(1, 10) == 10 do spawn_enemy(state)
     dt := rl.GetFrameTime()
     g.t_since_attack += dt
     if g.t_since_attack >= 1/state.player.attack_speed {
@@ -218,7 +217,10 @@ update :: proc(state: ^GameState) -> bool {
         shoot(state)
     }
     for &p, i in state.projectiles {
-        if dist(p.position, 600) > 2000 do unordered_remove(&state.projectiles, i)
+        if p.position.x > g.win_size.x || p.position.x < 0 || p.position.y > g.win_size.y || p.position.y < 0 {
+            unordered_remove(&state.projectiles, i)
+        }
+
         dx := cos(p.direction);
         dy := sin(p.direction);
 
@@ -279,7 +281,7 @@ spawn_enemy :: proc(state: ^GameState) {
     }
 
     enemy := Enemy{
-        speed    = 50, // customize as needed
+        speed    = 100, // customize as needed
         position = enemy_pos,
         radius   = 32
     };
@@ -292,15 +294,16 @@ dir_to_closest_enemy :: proc(state: ^GameState) -> (shoot: bool, dir: f32) {
     slice.sort_by(state.enemies[:], 
         proc(e1, e2: Enemy) -> bool {
             centre := g.win_size/2
-            d1 := dist(e1.position, centre)
-            d2 := dist(e2.position, centre)
-            return d1 > d2
+            return dist(e1.position, centre) < dist(e2.position, centre)
         }
     )
 
     centre := g.win_size/2
-    if len(state.projectiles) >= len(state.enemies) do return false, 0
+    if len(state.projectiles) >= len(state.enemies) {
+        return false, 0
+    }
     target := state.enemies[len(state.projectiles)]
+    if dist(target.position, centre) > state.player.attack_radius do return false, 0
     dir_vec := vec2 {
         target.position.x - centre.x,
         centre.y - target.position.y
@@ -313,7 +316,9 @@ dir_to_closest_enemy :: proc(state: ^GameState) -> (shoot: bool, dir: f32) {
 shoot :: proc(state: ^GameState) {
     origin := g.win_size/2;
     shoot, dir := dir_to_closest_enemy(state)
-    if !shoot do return
+    if !shoot {
+        return
+    } 
     sheet := &state.sprite_sheets[state.active_sheet]
     max_size: f32
     for frame in sheet.rects {
@@ -333,6 +338,7 @@ shoot :: proc(state: ^GameState) {
 
 draw :: proc(state: GameState) {
 
+    rl.DrawCircleLinesV(g.win_size/2, state.player.attack_radius, rl.BLUE)
 
     for p in state.projectiles {
         frame := g.frame/2%u64(len(p.sheet.rects))
