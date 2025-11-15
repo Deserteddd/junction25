@@ -1,12 +1,12 @@
 package aigame
 
 import rl "vendor:raylib"
+import stbi "vendor:stb/image"
 import "core:slice"
 import "core:strings"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
-import "core:mem"
 
 dist :: linalg.distance
 sin :: math.sin
@@ -122,110 +122,6 @@ Globals :: struct {
 }
 
 g: Globals
-
-load_sprite_sheet :: proc(path: string) -> SpriteSheet {
-    path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
-    rl_img := rl.LoadImage(path_cstr)
-    defer rl.UnloadImage(rl_img)
-    width  := i32(rl_img.width)
-    height := i32(rl_img.height)
-    pixels := slice.bytes_from_ptr(rl_img.data, int(rl_img.width * rl_img.height * 4))
-
-    horizontal_segments,
-    vertical_segments: [dynamic][2]i32
-    defer delete(horizontal_segments)
-    defer delete(vertical_segments)
-    {
-        non_empty_streak: i32
-        start: i32
-        for row: i32 = 0; row < height; row += 1 {
-            row_is_empty := true
-
-            row_start := row * width * 4
-
-            for col: i32 = 0; col < width; col += 1 {
-                alpha := pixels[row_start + col*4 + 3]
-
-                if alpha > 2 {
-                    row_is_empty = false
-                    break
-                }
-            }
-
-            if !row_is_empty {
-                if non_empty_streak == 0 do start = row
-                non_empty_streak += 1
-            } else {
-                if non_empty_streak > height/8 {
-                    segment: [2]i32 = {start, row}
-                    append(&horizontal_segments, segment)
-                }
-                non_empty_streak = 0
-            }
-        }
-    }
-    {
-        non_empty_streak: i32
-        start: i32
-
-        for col: i32 = 0; col < width; col += 1 {
-            col_is_empty := true
-
-            for row: i32 = 0; row < height; row += 1 {
-                pixel_index := row * width * 4 + col * 4
-                alpha := pixels[pixel_index + 3]
-
-                if alpha > 2 {
-                    col_is_empty = false
-                    break
-                }
-            }
-
-            if !col_is_empty {
-                if non_empty_streak == 0 do start = col
-                non_empty_streak += 1
-            } else {
-                if non_empty_streak > width/8 {
-                    segment: [2]i32 = {start, col}
-                    append(&vertical_segments, segment)
-                }
-                non_empty_streak = 0
-            }
-        }
-    }
-    rects: [dynamic]Rect
-    for vertical, i in vertical_segments {
-        for horizontal, j in horizontal_segments {
-            rect := Rect {
-                f32(vertical.x),
-                f32(horizontal.x), 
-                f32(vertical.y - vertical.x),
-                f32(horizontal.y - horizontal.x),
-            }
-            append(&rects, rect)
-        }
-    }
-    for rect in rects {
-        fmt.println(rect)
-
-    }
-    // LoadTextureFromImage copies the data, so we can safely unload the image
-    sheet: SpriteSheet
-    sheet.texture = rl.LoadTextureFromImage(rl_img)
-    // Convert dynamic array to a persistent slice by cloning
-    // We need to allocate new memory since the dynamic array will be freed
-    if len(rects) > 0 {
-        // Allocate slice with context allocator to ensure it persists
-        allocated_rects := make([]Rect, len(rects), context.allocator)
-        for i in 0..<len(rects) {
-            allocated_rects[i] = rects[i]
-        }
-        sheet.rects = allocated_rects
-    } else {
-        sheet.rects = nil
-    }
-    return sheet
-}
 
 
 toggle_fullscreen :: proc() {
@@ -1191,28 +1087,23 @@ draw :: proc(state: GameState) {
         if state.player_sprite_sheet.texture.id != 0 && 
            state.player_sprite_sheet.rects != nil && 
            len(state.player_sprite_sheet.rects) > 0 {
-            // Use sprite sheet animation (same approach as enemies)
             frame_idx := (state.player.animation_frame / 8) % u64(len(state.player_sprite_sheet.rects))
-            frame := state.player_sprite_sheet.rects[frame_idx]
-            
-            // Use a fixed size for player sprite (similar to enemy approach)
-            player_size: f32 = 60.0  // Fixed size in pixels
+
+            player_size: f32 = 64.0  // Fixed size in pixels
             
             dst_rect := Rect {
-                screen_center.x - player_size/2,
-                screen_center.y - player_size/2,
+                g.win_size.x/2 - player_size/2+30,
+                g.win_size.y/2 - player_size/2+20,
                 player_size,
                 player_size,
             }
-            
-            // Draw the sprite using the frame (exactly like enemies do)
             rl.DrawTexturePro(
                 state.player_sprite_sheet.texture,
-                frame,
+                state.player_sprite_sheet.rects[frame_idx],
                 dst_rect,
-                {player_size/2, player_size/2},
+                {dst_rect.width/2, dst_rect.height/2},
                 0,
-                rl.WHITE
+                255
             )
         }
     }
@@ -1301,4 +1192,105 @@ draw :: proc(state: GameState) {
         restart_width := rl.MeasureText(restart_cstr, 30)
         rl.DrawText(restart_cstr, i32(g.win_size.x/2 - f32(restart_width)/2), i32(g.win_size.y/2 + 20), 30, rl.WHITE)
     }
+}
+load_pixels :: proc(path: string) -> (pixels: []byte, size: [2]i32) {
+    path_cstr := strings.clone_to_cstring(path, context.temp_allocator);
+    pixel_data := stbi.load(path_cstr, &size.x, &size.y, nil, 4)
+    assert(size != 0)
+    assert(pixel_data != nil)
+    pixels = slice.bytes_from_ptr(pixel_data, int(size.x * size.y * 4))
+    assert(pixels != nil)
+    return
+}
+load_sprite_sheet :: proc(path: string) -> SpriteSheet {
+    pixels, size := load_pixels(path)
+    defer stbi.image_free(raw_data(pixels))
+    width  := size.x
+    height := size.y
+
+    horizontal_segments,
+    vertical_segments: [dynamic][2]i32
+    defer delete(horizontal_segments)
+    defer delete(vertical_segments)
+    {
+        non_empty_streak: i32
+        start: i32
+        for row: i32 = 0; row < height; row += 1 {
+            row_is_empty := true
+
+            row_start := row * width * 4
+
+            for col: i32 = 0; col < width; col += 1 {
+                alpha := pixels[row_start + col*4 + 3]
+
+                if alpha > 2 {
+                    row_is_empty = false
+                    break
+                }
+            }
+
+            if !row_is_empty {
+                if non_empty_streak == 0 do start = row
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > 10 {
+                    segment: [2]i32 = {start, row}
+                    append(&horizontal_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    {
+        non_empty_streak: i32
+        start: i32
+
+        for col: i32 = 0; col < width; col += 1 {
+            col_is_empty := true
+
+            for row: i32 = 0; row < height; row += 1 {
+                pixel_index := row * width * 4 + col * 4
+                alpha := pixels[pixel_index + 3]
+
+                if alpha > 2 {
+                    col_is_empty = false
+                    break
+                }
+            }
+
+            if !col_is_empty {
+                if non_empty_streak == 0 do start = col
+                non_empty_streak += 1
+            } else {
+                if non_empty_streak > 10 {
+                    segment: [2]i32 = {start, col}
+                    append(&vertical_segments, segment)
+                }
+                non_empty_streak = 0
+            }
+        }
+    }
+    rects: [dynamic]Rect
+    for vertical, i in vertical_segments {
+        for horizontal, j in horizontal_segments {
+            rect := Rect {
+                f32(vertical.x),
+                f32(horizontal.x), 
+                f32(vertical.y - vertical.x),
+                f32(horizontal.y - horizontal.x),
+            }
+            append(&rects, rect)
+        }
+    }
+    rl_img: rl.Image = {
+        data = raw_data(pixels),
+        width = size.x,
+        height = size.y,
+        mipmaps = 1,
+        format = .UNCOMPRESSED_R8G8B8A8
+    }
+    sheet: SpriteSheet
+    sheet.texture = rl.LoadTextureFromImage(rl_img)
+    sheet.rects = rects[:]
+    return sheet
 }
