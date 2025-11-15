@@ -23,13 +23,21 @@ GameState :: struct {
     sprite_sheets:  [dynamic]SpriteSheet,
     projectiles:    [dynamic]Projectile,
     enemies:        [dynamic]Enemy,
-    active_sheet:   i32,
 }
 
 Enemy :: struct {
-    position: vec2,
-    radius:   f32,
-    speed:    f32,
+    position:  vec2,
+    radius:    f32,
+    speed:     f32,
+    direction: Direction,
+    sheet:     ^SpriteSheet
+}
+
+Direction :: enum u8 {
+    DOWN  = 0,
+    RIGHT = 1,
+    UP    = 2,
+    LEFT  = 3,
 }
 
 Projectile :: struct {
@@ -92,7 +100,7 @@ load_sprite_sheet :: proc(path: string) -> SpriteSheet {
                 if non_empty_streak == 0 do start = row
                 non_empty_streak += 1
             } else {
-                if non_empty_streak > height/8 {
+                if non_empty_streak > 10 {
                     segment: [2]i32 = {start, row}
                     append(&horizontal_segments, segment)
                 }
@@ -121,14 +129,17 @@ load_sprite_sheet :: proc(path: string) -> SpriteSheet {
                 if non_empty_streak == 0 do start = col
                 non_empty_streak += 1
             } else {
-                if non_empty_streak > width/8 {
+                if non_empty_streak > 10 {
                     segment: [2]i32 = {start, col}
+                    fmt.println("Yess")
                     append(&vertical_segments, segment)
                 }
                 non_empty_streak = 0
             }
         }
     }
+    fmt.println(horizontal_segments)
+    fmt.println(vertical_segments)
     rects: [dynamic]Rect
     for vertical, i in vertical_segments {
         for horizontal, j in horizontal_segments {
@@ -148,7 +159,6 @@ load_sprite_sheet :: proc(path: string) -> SpriteSheet {
         mipmaps = 1,
         format = .UNCOMPRESSED_R8G8B8A8
     }
-
     sheet: SpriteSheet
     sheet.texture = rl.LoadTextureFromImage(rl_img)
     sheet.rects = rects[:]
@@ -158,6 +168,7 @@ load_sprite_sheet :: proc(path: string) -> SpriteSheet {
 load_pixels :: proc(path: string) -> (pixels: []byte, size: [2]i32) {
     path_cstr := strings.clone_to_cstring(path, context.temp_allocator);
     pixel_data := stbi.load(path_cstr, &size.x, &size.y, nil, 4)
+    assert(size != 0)
     assert(pixel_data != nil)
     pixels = slice.bytes_from_ptr(pixel_data, int(size.x * size.y * 4))
     assert(pixels != nil)
@@ -183,6 +194,7 @@ init :: proc() -> GameState {
         attack_radius = 350
     }
     append(&state.sprite_sheets, load_sprite_sheet("assets/gpt_test1.png"))
+    append(&state.sprite_sheets, load_sprite_sheet("assets/zimbo.png"))
     return state
 }
 
@@ -209,8 +221,14 @@ main :: proc() {
 update :: proc(state: ^GameState) -> bool {
     if rl.IsKeyDown(.LEFT_CONTROL) && rl.IsKeyDown(.C) do return false
     if rl.IsKeyPressed(.F) do toggle_fullscreen()
-    if rl.GetRandomValue(1, 10) == 10 do spawn_enemy(state)
     dt := rl.GetFrameTime()
+
+    // if rl.IsKeyDown(.W) do g.player_pos.y -= dt * 100
+    // if rl.IsKeyDown(.S) do g.player_pos.y += dt * 100
+    // if rl.IsKeyDown(.A) do g.player_pos.x -= dt * 100
+    // if rl.IsKeyDown(.D) do g.player_pos.x += dt * 100
+
+    if rl.GetRandomValue(1, 10) == 10 do spawn_enemy(state)
     g.t_since_attack += dt
     if g.t_since_attack >= 1/state.player.attack_speed {
         g.t_since_attack = 0
@@ -249,42 +267,45 @@ update :: proc(state: ^GameState) -> bool {
 }
 
 circle_intersect :: proc(p1: vec2, r1: f32, p2: vec2, r2: f32) -> bool {
-    return dist(p1, p2) < r1+r2
+    return dist(p1, p2) < (r1+r2)*0.5
 }
 
 spawn_enemy :: proc(state: ^GameState) {
-    margin   := f32(32); // Distance outside screen bounds
-    side := rl.GetRandomValue(0, 3); // 0=left, 1=right, 2=top, 3=bottom
-    enemy_pos := vec2{};
-
+    margin   := f32(32) // Distance outside screen bounds
+    side := rl.GetRandomValue(0, 3) // 0=left, 1=right, 2=top, 3=bottom
+    enemy_pos: vec2
+    enemy: Enemy
+    enemy.speed = 100
+    enemy.radius = 32
+    enemy.sheet = &state.sprite_sheets[1]
     switch side {
     case 0: // Left
-        enemy_pos = {
+        enemy.position = {
             -margin,
             f32(rl.GetRandomValue(0, i32(g.win_size.y))),
-        };
+        }
+        enemy.direction = .RIGHT
     case 1: // Right
-        enemy_pos = {
+        enemy.position = {
             g.win_size.x + margin,
             f32(rl.GetRandomValue(0, i32(g.win_size.y))),
-        };
+        }
+        enemy.direction = .LEFT
     case 2: // Top
-        enemy_pos = {
+        enemy.position = {
             f32(rl.GetRandomValue(0, i32(g.win_size.x))),
             -margin,
-        };
+        }
+        enemy.direction = .DOWN
     case 3: // Bottom
-        enemy_pos = {
+        enemy.position = {
             f32(rl.GetRandomValue(0, i32(g.win_size.x))),
             g.win_size.y + margin,
-        };
+        }
+        enemy.direction = .UP
     }
 
-    enemy := Enemy{
-        speed    = 100, // customize as needed
-        position = enemy_pos,
-        radius   = 32
-    };
+
 
     append(&state.enemies, enemy);
 }
@@ -319,14 +340,14 @@ shoot :: proc(state: ^GameState) {
     if !shoot {
         return
     } 
-    sheet := &state.sprite_sheets[state.active_sheet]
+    sheet := &state.sprite_sheets[0]
     max_size: f32
     for frame in sheet.rects {
         size := math.min(frame.height, frame.width)
         if size > max_size do max_size = size
     }
     projectile: Projectile = {
-        position    = origin,
+        position    = g.win_size/2,
         radius      = max_size/8,
         speed       = 500,
         direction   = dir,
@@ -341,7 +362,7 @@ draw :: proc(state: GameState) {
     rl.DrawCircleLinesV(g.win_size/2, state.player.attack_radius, rl.BLUE)
 
     for p in state.projectiles {
-        frame := g.frame/2%u64(len(p.sheet.rects))
+        frame := g.frame%u64(len(p.sheet.rects))
         dst_rect := Rect {
             p.position.x, 
             p.position.y, 
@@ -358,9 +379,22 @@ draw :: proc(state: GameState) {
         )
     }
     for e in state.enemies {
-        rl.DrawCircleV(e.position, e.radius, rl.RED)
+        frame := u8(e.direction) + 4*u8((g.frame/10)%4)
+        dst_rect := Rect {
+            e.position.x, 
+            e.position.y, 
+            e.sheet.rects[frame].width/2, 
+            e.sheet.rects[frame].height/2
+        }
+        rl.DrawTexturePro(
+            e.sheet.texture,
+            e.sheet.rects[frame],
+            dst_rect,
+            {dst_rect.width/2, dst_rect.height/2},
+            0,
+            255
+        )
     }
-
     // Player
     {
         player_sprite := state.player.sprite
