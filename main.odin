@@ -48,6 +48,8 @@ HEALTH_SCALE_PER_ROOM :: 1.5  // Health multiplier per room (50% increase - more
 SPEED_SCALE_PER_ROOM :: 1.2  // Speed multiplier per room (20% increase - more aggressive)
 ENEMY_SEPARATION_DISTANCE :: 50.0  // Minimum distance enemies try to maintain from each other
 ENEMY_SEPARATION_FORCE :: 200.0  // Force applied to separate overlapping enemies
+WEAPON_DROP_CHANCE :: 0.3  // 30% chance for enemies to drop weapons
+WEAPON_PICKUP_DISTANCE :: 40.0  // Distance player needs to be to pick up a weapon
 
 GameState :: struct {
     player:           Player,
@@ -57,9 +59,11 @@ GameState :: struct {
     projectiles:      [dynamic]Projectile,
     enemy_projectiles: [dynamic]Projectile,  // Projectiles shot by enemies/bosses
     enemies:          [dynamic]Enemy,
+    dropped_weapons:  [dynamic]DroppedWeapon,  // Weapons dropped by enemies
     active_sheet:     i32,
     board:            Board,
     room_textures:    [NUM_ROOM_TYPES]rl.Texture2D,  // Textures for each room type
+    weapon_textures:  [5]rl.Texture2D,  // Textures for each weapon type (PISTOL, SHOTGUN, RIFLE, SNIPER, MACHINE_GUN)
     background_music: rl.Music,  // Background music
     music_enabled:    bool,      // Whether music is enabled
     is_game_over:     bool,      // True if player is dead
@@ -94,11 +98,36 @@ Projectile :: struct {
     sheet:        ^SpriteSheet
 }
 
+Weapon_Type :: enum {
+    PISTOL,        // Fast, low damage, no spread
+    SHOTGUN,       // Slow, high damage, wide spread
+    RIFLE,         // Medium speed, medium damage, tight spread
+    SNIPER,        // Very slow, very high damage, no spread
+    MACHINE_GUN,   // Very fast, low damage, small spread
+}
+
+Weapon :: struct {
+    weapon_type:  Weapon_Type,
+    fire_rate:    f32,      // Shots per second
+    spread:       f32,      // Spread angle in radians (0 = no spread)
+    damage:       f32,      // Damage per projectile
+    projectile_speed: f32,  // Speed of projectiles
+    num_projectiles: i32,   // Number of projectiles per shot (for shotguns)
+    name:         string,   // Weapon name for display
+    texture:      rl.Texture2D,  // Texture for the weapon
+}
+
+DroppedWeapon :: struct {
+    position:     vec2,
+    weapon:       Weapon,
+    pickup_timer: f32,  // Time since dropped (for visual effects)
+}
+
 Player :: struct {
     sprite:           rl.Texture2D,  // Fallback static texture
     sprite_sheet:     ^SpriteSheet,  // Sprite sheet for animation (nil if using static texture)
     animation_frame:  u64,  // Current animation frame
-    attack_speed:     f32,
+    attack_speed:     f32,  // Deprecated - use current_weapon.fire_rate instead
     position:         vec2,  // Player position in world space
     velocity:         vec2,  // Current velocity (for acceleration)
     speed:            f32,   // Maximum movement speed
@@ -107,6 +136,8 @@ Player :: struct {
     max_hp:           i32,   // Maximum health points
     hp:               i32,   // Current health points
     invulnerable_time: f32,  // Time remaining of invulnerability after being hit
+    current_weapon:   Weapon,  // Currently equipped weapon
+    aim_direction:    f32,  // Direction player is aiming (in radians)
 }
 
 SpriteSheet :: struct {
@@ -318,6 +349,20 @@ init :: proc() -> GameState {
         player.max_hp = PLAYER_MAX_HP
         player.hp = PLAYER_MAX_HP
         player.invulnerable_time = 0.0
+        // Weapon textures will be loaded later, use empty array for now (will be updated after textures load)
+        // Create a temporary weapon that will be replaced after textures are loaded
+        temp_weapon := Weapon{
+            weapon_type = .PISTOL,
+            fire_rate = 3.0,
+            spread = 0.0,
+            damage = 1.0,
+            projectile_speed = 500.0,
+            num_projectiles = 1,
+            name = "Pistol",
+            texture = {},  // Will be set after textures load
+        }
+        player.current_weapon = temp_weapon
+        player.aim_direction = 0.0  // Start aiming right
         player.animation_frame = 0
         player.sprite_sheet = nil  // Will be set if sprite sheet is found
     }
@@ -415,6 +460,35 @@ init :: proc() -> GameState {
         state.room_textures[i] = load_room_texture(room_type)
     }
     
+    // Load weapon textures
+    weapon_texture_paths := [5]string{
+        "assets/pistol.png",      // PISTOL
+        "assets/shotgun.png",     // SHOTGUN
+        "assets/rifle.png",       // RIFLE
+        "assets/sniper.png",      // SNIPER
+        "assets/machine_gun.png", // MACHINE_GUN
+    }
+    
+    for i in 0..<5 {
+        path := weapon_texture_paths[i]
+        path_cstr := strings.clone_to_cstring(path, context.temp_allocator)
+        texture := rl.LoadTexture(path_cstr)
+        
+        // If texture failed to load, create a fallback colored texture
+        if texture.id == 0 {
+            // Create a simple colored rectangle as fallback
+            img := rl.GenImageColor(32, 32, rl.GRAY)
+            texture = rl.LoadTextureFromImage(img)
+            rl.UnloadImage(img)
+        }
+        
+        state.weapon_textures[i] = texture
+    }
+    
+    // Update player's starting weapon with proper texture
+    state.player.current_weapon = create_weapon(.PISTOL, state.weapon_textures)
+    state.player.aim_direction = 0.0  // Initialize aim direction
+    
     // Load background music (tries .mp3, .ogg, then .wav)
     music_path := "assets/background_music.mp3"  // Try .mp3 first
     music_path_cstr := strings.clone_to_cstring(music_path, context.temp_allocator)
@@ -485,6 +559,8 @@ start_next_room :: proc(state: ^GameState) {
     state.room_number += 1
     // Reset player position to center when entering new room
     state.player.position = {0, 0}
+    // Clear dropped weapons when entering new room
+    resize(&state.dropped_weapons, 0)
     // Use room number to get different room types (cycles through all types)
     state.board = generate_room(MAX_TILES + state.room_number)
     start_wave(state)
@@ -781,8 +857,24 @@ update :: proc(state: ^GameState) -> bool {
         start_next_room(state)
     }
     
+    // Update weapon pickup timers and check for pickups
+    for &dw, i in state.dropped_weapons {
+        dw.pickup_timer += dt
+        
+        // Check if player is close enough to pick up
+        distance_to_weapon := dist(state.player.position, dw.position)
+        if distance_to_weapon < WEAPON_PICKUP_DISTANCE {
+            // Player picks up weapon
+            state.player.current_weapon = dw.weapon
+            unordered_remove(&state.dropped_weapons, i)
+            break  // Only pick up one weapon per frame
+        }
+    }
+    
+    // Shooting based on weapon fire rate
     g.t_since_attack += dt
-    if g.t_since_attack >= 1/state.player.attack_speed {
+    weapon_fire_rate := state.player.current_weapon.fire_rate
+    if weapon_fire_rate > 0 && g.t_since_attack >= 1.0/weapon_fire_rate {
         g.t_since_attack = 0
         shoot(state)
     }
@@ -940,11 +1032,26 @@ update :: proc(state: ^GameState) -> bool {
                 // Remove projectile
                 unordered_remove(&state.projectiles, j)
                 
-                // Deal damage to enemy
-                state.enemies[i].health -= 1
+                // Deal damage to enemy (use projectile damage)
+                state.enemies[i].health -= i32(p.damage)
                 
                 // If enemy is dead, remove it
                 if state.enemies[i].health <= 0 {
+                    enemy_pos := state.enemies[i].position
+                    is_boss := state.enemies[i].is_boss
+                    
+                    // Chance to drop weapon
+                    drop_chance := f32(rl.GetRandomValue(0, 100)) / 100.0
+                    if drop_chance < WEAPON_DROP_CHANCE {
+                        weapon_type := get_random_weapon_type(is_boss)
+                        dropped_weapon := DroppedWeapon{
+                            position = enemy_pos,
+                            weapon = create_weapon(weapon_type, state.weapon_textures),
+                            pickup_timer = 0.0,
+                        }
+                        append(&state.dropped_weapons, dropped_weapon)
+                    }
+                    
                     if state.enemies[i].is_boss {
                         // Track boss kill separately if needed
                     }
@@ -960,6 +1067,95 @@ update :: proc(state: ^GameState) -> bool {
 
 circle_intersect :: proc(p1: vec2, r1: f32, p2: vec2, r2: f32) -> bool {
     return dist(p1, p2) <(r1+r2)/2
+}
+
+// Create weapon based on type (requires weapon_textures array from GameState)
+create_weapon :: proc(weapon_type: Weapon_Type, weapon_textures: [5]rl.Texture2D) -> Weapon {
+    texture_idx: i32 = 0
+    switch weapon_type {
+        case .PISTOL:
+            texture_idx = 0
+            return Weapon{
+                weapon_type = .PISTOL,
+                fire_rate = 3.0,  // 3 shots per second
+                spread = 0.0,  // No spread
+                damage = 1.0,
+                projectile_speed = 500.0,
+                num_projectiles = 1,
+                name = "Pistol",
+                texture = weapon_textures[0],
+            }
+        case .SHOTGUN:
+            texture_idx = 1
+            return Weapon{
+                weapon_type = .SHOTGUN,
+                fire_rate = 0.8,  // Slow fire rate
+                spread = 0.5,  // Wide spread (about 30 degrees)
+                damage = 2.0,  // High damage per pellet
+                projectile_speed = 400.0,
+                num_projectiles = 5,  // 5 pellets per shot
+                name = "Shotgun",
+                texture = weapon_textures[1],
+            }
+        case .RIFLE:
+            texture_idx = 2
+            return Weapon{
+                weapon_type = .RIFLE,
+                fire_rate = 2.0,  // Medium fire rate
+                spread = 0.1,  // Small spread
+                damage = 1.5,
+                projectile_speed = 600.0,
+                num_projectiles = 1,
+                name = "Rifle",
+                texture = weapon_textures[2],
+            }
+        case .SNIPER:
+            texture_idx = 3
+            return Weapon{
+                weapon_type = .SNIPER,
+                fire_rate = 0.5,  // Very slow fire rate
+                spread = 0.0,  // No spread
+                damage = 5.0,  // Very high damage
+                projectile_speed = 800.0,
+                num_projectiles = 1,
+                name = "Sniper",
+                texture = weapon_textures[3],
+            }
+        case .MACHINE_GUN:
+            texture_idx = 4
+            return Weapon{
+                weapon_type = .MACHINE_GUN,
+                fire_rate = 8.0,  // Very fast fire rate
+                spread = 0.15,  // Small spread
+                damage = 0.8,  // Low damage
+                projectile_speed = 550.0,
+                num_projectiles = 1,
+                name = "Machine Gun",
+                texture = weapon_textures[4],
+            }
+    }
+    // Default to pistol
+    return create_weapon(.PISTOL, weapon_textures)
+}
+
+// Get random weapon type (weighted towards better weapons for bosses)
+get_random_weapon_type :: proc(is_boss: bool) -> Weapon_Type {
+    rand_val := f32(rl.GetRandomValue(0, 100)) / 100.0
+    if is_boss {
+        // Bosses drop better weapons
+        if rand_val < 0.1 do return .PISTOL
+        if rand_val < 0.4 do return .SHOTGUN
+        if rand_val < 0.7 do return .RIFLE
+        if rand_val < 0.9 do return .SNIPER
+        return .MACHINE_GUN
+    } else {
+        // Regular enemies drop more common weapons
+        if rand_val < 0.4 do return .PISTOL
+        if rand_val < 0.6 do return .SHOTGUN
+        if rand_val < 0.8 do return .RIFLE
+        if rand_val < 0.9 do return .SNIPER
+        return .MACHINE_GUN
+    }
 }
 
 spawn_enemy :: proc(state: ^GameState) {
@@ -1037,8 +1233,11 @@ dir_to_closest_enemy :: proc(state: ^GameState) -> f32 {
 
 shoot :: proc(state: ^GameState) {
     origin := state.player.position;
+    weapon := state.player.current_weapon
 
-    direction := dir_to_closest_enemy(state)
+    base_direction := dir_to_closest_enemy(state)
+    state.player.aim_direction = base_direction  // Store aim direction for weapon rendering
+    
     if len(state.sprite_sheets) == 0 || state.active_sheet < 0 || state.active_sheet >= i32(len(state.sprite_sheets)) {
         return // Safety check
     }
@@ -1052,15 +1251,31 @@ shoot :: proc(state: ^GameState) {
             if size > max_size do max_size = size
         }
     }
-    projectile: Projectile = {
-        position    = origin,
-        radius      = max_size/8,
-        speed       = 500,
-        direction   = direction,
-        damage      = 1,
-        sheet       = sheet
+    
+    // Fire multiple projectiles for shotguns
+    for i in 0..<weapon.num_projectiles {
+        // Calculate spread direction
+        direction := base_direction
+        if weapon.spread > 0 && weapon.num_projectiles > 1 {
+            // Spread projectiles evenly across spread angle
+            spread_offset := (f32(i) - f32(weapon.num_projectiles - 1) / 2.0) * (weapon.spread / f32(weapon.num_projectiles - 1))
+            direction += spread_offset
+        } else if weapon.spread > 0 {
+            // Single projectile with random spread
+            spread_offset := (f32(rl.GetRandomValue(0, 100)) / 100.0 - 0.5) * weapon.spread
+            direction += spread_offset
+        }
+        
+        projectile: Projectile = {
+            position    = origin,
+            radius      = max_size/8,
+            speed       = weapon.projectile_speed,
+            direction   = direction,
+            damage      = weapon.damage,
+            sheet       = sheet
+        }
+        append(&state.projectiles, projectile)
     }
-    append(&state.projectiles, projectile)
 }
 
 draw :: proc(state: GameState) {
@@ -1110,6 +1325,43 @@ draw :: proc(state: GameState) {
             -math.to_degrees(p.direction)+180,
             rl.RED  // Red tint for enemy projectiles
         )
+    }
+    
+    // Draw dropped weapons
+    for dw in state.dropped_weapons {
+        screen_pos := dw.position + g.camera_offset
+        
+        // Draw weapon texture with pulsing effect
+        pulse := math.sin(dw.pickup_timer * 3.0) * 0.2 + 1.0  // Pulse between 0.8 and 1.2
+        weapon_size: f32 = 40.0 * pulse
+        
+        // Draw weapon texture
+        if dw.weapon.texture.id != 0 {
+            src_rect := Rect{0, 0, f32(dw.weapon.texture.width), f32(dw.weapon.texture.height)}
+            dst_rect := Rect{
+                screen_pos.x - weapon_size/2,
+                screen_pos.y - weapon_size/2,
+                weapon_size,
+                weapon_size,
+            }
+            rl.DrawTexturePro(
+                dw.weapon.texture,
+                src_rect,
+                dst_rect,
+                {weapon_size/2, weapon_size/2},
+                0,  // No rotation for dropped weapons
+                rl.WHITE
+            )
+        } else {
+            // Fallback to colored circle if texture not loaded
+            weapon_color := rl.GRAY
+            rl.DrawCircleV(screen_pos, weapon_size/2, weapon_color)
+        }
+        
+        // Draw weapon name above
+        name_cstr := strings.clone_to_cstring(dw.weapon.name, context.temp_allocator)
+        text_width := rl.MeasureText(name_cstr, 12)
+        rl.DrawText(name_cstr, i32(screen_pos.x) - text_width/2, i32(screen_pos.y - weapon_size/2 - 20), 12, rl.WHITE)
     }
     
     // Draw enemies with camera offset (scaled down)
@@ -1215,6 +1467,38 @@ draw :: proc(state: GameState) {
                 rl.WHITE
             )
         }
+        
+        // Draw weapon in player's hand, rotated to face aim direction
+        if state.player.current_weapon.texture.id != 0 {
+            weapon_size: f32 = 35.0  // Weapon size
+            player_size: f32 = 60.0  // Same as player sprite size
+            // Position weapon slightly offset from player center (in front of player)
+            weapon_offset: f32 = player_size/2 + 5.0  // Offset from player center
+            weapon_pos := screen_center + vec2{
+                math.cos(state.player.aim_direction) * weapon_offset,
+                -math.sin(state.player.aim_direction) * weapon_offset,  // Negative because screen Y is inverted
+            }
+            
+            src_rect := Rect{0, 0, f32(state.player.current_weapon.texture.width), f32(state.player.current_weapon.texture.height)}
+            dst_rect := Rect{
+                weapon_pos.x - weapon_size/2,
+                weapon_pos.y - weapon_size/2,
+                weapon_size,
+                weapon_size,
+            }
+            
+            // Convert angle from radians to degrees, and adjust for screen coordinates
+            weapon_angle := -math.to_degrees(state.player.aim_direction) + 90.0  // +90 to point right initially
+            
+            rl.DrawTexturePro(
+                state.player.current_weapon.texture,
+                src_rect,
+                dst_rect,
+                {weapon_size/2, weapon_size/2},
+                weapon_angle,
+                rl.WHITE
+            )
+        }
     }
     
     // Draw HP bar
@@ -1245,6 +1529,11 @@ draw :: proc(state: GameState) {
     }
 
     rl.DrawFPS(10, 10)
+    
+    // Draw current weapon info
+    weapon_text := fmt.aprintf("Weapon: %s", state.player.current_weapon.name)
+    weapon_cstr := strings.clone_to_cstring(weapon_text, context.temp_allocator)
+    rl.DrawText(weapon_cstr, 10, 10, 20, rl.SKYBLUE)
     
     // Draw wave/room info
     room_text := fmt.aprintf("Room: %d", state.room_number)
