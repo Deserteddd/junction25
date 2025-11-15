@@ -7,6 +7,7 @@ import "core:strings"
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
+import "core:sort"
 
 dist :: linalg.distance
 sin :: math.sin
@@ -250,7 +251,7 @@ circle_intersect :: proc(p1: vec2, r1: f32, p2: vec2, r2: f32) -> bool {
 }
 
 spawn_enemy :: proc(state: ^GameState) {
-    margin   := f32(64); // Distance outside screen bounds
+    margin   := f32(32); // Distance outside screen bounds
     side := rl.GetRandomValue(0, 3); // 0=left, 1=right, 2=top, 3=bottom
     enemy_pos := vec2{};
 
@@ -286,31 +287,33 @@ spawn_enemy :: proc(state: ^GameState) {
     append(&state.enemies, enemy);
 }
 
-dir_to_closest_enemy :: proc(state: ^GameState) -> f32 {
-    centre := g.win_size/2
-    min_dist: f32 = 1e12
-    min_pos: vec2
-    for e in state.enemies {
-        distance := dist(e.position, centre)
-        if distance < min_dist {
-            min_dist = distance
-            min_pos = e.position
-        }
-    }
-    dir := min_pos - centre
-    dir_vec := vec2{
-        min_pos.x - centre.x,
-        centre.y - min_pos.y
-    };
-    direction := math.atan2(dir_vec.y, dir_vec.x);
+dir_to_closest_enemy :: proc(state: ^GameState) -> (shoot: bool, dir: f32) {
 
-    return direction
+    slice.sort_by(state.enemies[:], 
+        proc(e1, e2: Enemy) -> bool {
+            centre := g.win_size/2
+            d1 := dist(e1.position, centre)
+            d2 := dist(e2.position, centre)
+            return d1 > d2
+        }
+    )
+
+    centre := g.win_size/2
+    if len(state.projectiles) >= len(state.enemies) do return false, 0
+    target := state.enemies[len(state.projectiles)]
+    dir_vec := vec2 {
+        target.position.x - centre.x,
+        centre.y - target.position.y
+    }
+    dir = math.atan2(dir_vec.y, dir_vec.x);
+
+    return true, dir
 }
 
 shoot :: proc(state: ^GameState) {
     origin := g.win_size/2;
-
-    direction := dir_to_closest_enemy(state)
+    shoot, dir := dir_to_closest_enemy(state)
+    if !shoot do return
     sheet := &state.sprite_sheets[state.active_sheet]
     max_size: f32
     for frame in sheet.rects {
@@ -321,7 +324,7 @@ shoot :: proc(state: ^GameState) {
         position    = origin,
         radius      = max_size/8,
         speed       = 500,
-        direction   = direction,
+        direction   = dir,
         damage      = 1,
         sheet       = sheet
     }
