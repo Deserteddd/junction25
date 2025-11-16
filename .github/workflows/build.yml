@@ -1,0 +1,60 @@
+name: Build Game for All Platforms
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            output: junction25_release.exe
+            target: windows_amd64
+          - os: macos-latest
+            output: junction25_release
+            target: 
+          - os: ubuntu-latest
+            output: junction25_release
+            target: linux_amd64
+    
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Odin
+        uses: tekkac/odin-setup-action@v1
+        with:
+          version: dev-2024-11
+      
+      - name: Build executable
+        run: |
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            odin build . -out:${{ matrix.output }} -target:${{ matrix.target }} -o:speed
+          elif [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+            odin build . -out:${{ matrix.output }} -target:${{ matrix.target }} -o:speed
+          else
+            odin build . -out:${{ matrix.output }} -o:speed
+          fi
+      
+      - name: Create distribution package
+        run: |
+          mkdir -p dist
+          cp ${{ matrix.output }} dist/
+          cp -r assets dist/
+          cp gemini_api_bridge.py dist/
+          echo "Platform: ${{ matrix.os }}" > dist/PLATFORM.txt
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.os }}-build
+          path: dist/*
+          retention-days: 30
+
